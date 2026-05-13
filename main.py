@@ -1,10 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
+from curl_cffi import requests as curl_requests
+from yfinance_patch import patch_yfdata_cookie_basic, create_browser_session
 import time
 import random
 from functools import wraps
 from datetime import datetime
+
+# Apply the patch to fix cookie handling
+patch_yfdata_cookie_basic()
 
 app = FastAPI()
 
@@ -15,9 +20,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate limiting settings
-REQUESTS_PER_SECOND = 10
-BATCH_SIZE = 50  # Max symbols per batch request
+# Create a persistent browser session (reused across requests)
+browser_session = create_browser_session(impersonate="chrome120")
 
 # Cache settings
 CACHE_TTL = 30  # seconds for quotes
@@ -26,7 +30,7 @@ CHART_CACHE_TTL = 300  # seconds for charts
 quote_cache = {}
 chart_cache = {}
 
-def polite_delay(base_delay=0.5, jitter=0.3):
+def polite_delay(base_delay=1.0, jitter=0.5):
     """Add random delay between requests"""
     time.sleep(base_delay + random.uniform(0, jitter))
 
@@ -50,6 +54,8 @@ def health():
 
 @app.get("/quote/{symbol}")
 def get_quote(symbol: str):
+    """Get real-time quote with browser impersonation"""
+    
     # Check cache first
     cache_key = f"quote_{symbol}"
     cached = get_cached(cache_key, quote_cache, CACHE_TTL)
@@ -57,12 +63,13 @@ def get_quote(symbol: str):
         return cached
     
     try:
-        ticker = yf.Ticker(symbol)
+        # Use the browser session to avoid rate limits
+        ticker = yf.Ticker(symbol, session=browser_session)
         info = ticker.info
         history = ticker.history(period="1d")
         
-        # Small delay to be polite
-        polite_delay(0.2, 0.1)
+        # Polite delay
+        polite_delay(0.5, 0.3)
         
         if len(history) > 0:
             last_row = history.iloc[-1]
@@ -91,54 +98,52 @@ def get_quote(symbol: str):
 
 @app.get("/bulk")
 def get_bulk_quotes(symbols: str):
-    """Fetch multiple quotes efficiently using batch request"""
+    """Fetch multiple quotes - using individual Ticker objects with session"""
     symbol_list = [s.strip().upper() for s in symbols.split(",")]
+    results = []
     
-    # Use batch download for better performance
-    try:
-        # Batch download historical data for all symbols at once
-        data = yf.download(symbol_list, period="1d", group_by='ticker', threads=True)
-        
-        results = []
-        for symbol in symbol_list:
-            try:
-                if symbol in data:
-                    last_row = data[symbol].iloc[-1]
-                    current_price = float(last_row['Close'])
-                    open_price = float(last_row['Open'])
-                    change = current_price - open_price
-                    change_percent = (change / open_price) * 100 if open_price > 0 else 0
-                    
-                    results.append({
-                        "symbol": symbol,
-                        "price": round(current_price, 2),
-                        "change": round(change, 2),
-                        "changePercent": round(change_percent, 2),
-                        "companyName": symbol,
-                        "success": True
-                    })
-                else:
-                    results.append({"symbol": symbol, "success": False, "error": "No data"})
-            except Exception as e:
-                results.append({"symbol": symbol, "success": False, "error": str(e)})
-        
-        return {"quotes": results}
-    except Exception as e:
-        # Fallback to individual requests if batch fails
-        results = []
-        for symbol in symbol_list:
-            results.append(get_quote(symbol))
-        return {"quotes": results}
+    for symbol in symbol_list:
+        try:
+            # Use the browser session for each ticker
+            ticker = yf.Ticker(symbol, session=browser_session)
+            info = ticker.info
+            history = ticker.history(period="1d")
+            
+            polite_delay(0.5, 0.3)
+            
+            if len(history) > 0:
+                last_row = history.iloc[-1]
+                current_price = float(last_row['Close'])
+                open_price = float(last_row['Open'])
+                change = current_price - open_price
+                change_percent = (change / open_price) * 100 if open_price > 0 else 0
+                
+                results.append({
+                    "symbol": symbol,
+                    "price": round(current_price, 2),
+                    "change": round(change, 2),
+                    "changePercent": round(change_percent, 2),
+                    "companyName": info.get('longName', symbol),
+                    "success": True
+                })
+            else:
+                results.append({"symbol": symbol, "success": False, "error": "No data"})
+        except Exception as e:
+            results.append({"symbol": symbol, "success": False, "error": str(e)})
+    
+    return {"quotes": results}
 
 @app.get("/chart/{symbol}")
 def get_chart(symbol: str, period: str = "1mo"):
+    """Get historical chart data with browser impersonation"""
+    
     cache_key = f"chart_{symbol}_{period}"
     cached = get_cached(cache_key, chart_cache, CHART_CACHE_TTL)
     if cached:
         return cached
     
     try:
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(symbol, session=browser_session)
         
         if period == "1d":
             history = ticker.history(period="1d", interval="5m")
@@ -147,7 +152,7 @@ def get_chart(symbol: str, period: str = "1mo"):
         else:
             history = ticker.history(period=period)
         
-        polite_delay(0.2, 0.1)
+        polite_delay(0.5, 0.3)
         
         if not history.empty:
             chart_data = []

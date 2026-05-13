@@ -1,18 +1,44 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
-from datetime import datetime, timedelta
-import pandas as pd
+import time
+import random
+from functools import wraps
+from datetime import datetime
 
 app = FastAPI()
 
-# Enable CORS for your Android app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate limiting settings
+REQUESTS_PER_SECOND = 10
+BATCH_SIZE = 50  # Max symbols per batch request
+
+# Cache settings
+CACHE_TTL = 30  # seconds for quotes
+CHART_CACHE_TTL = 300  # seconds for charts
+
+quote_cache = {}
+chart_cache = {}
+
+def polite_delay(base_delay=0.5, jitter=0.3):
+    """Add random delay between requests"""
+    time.sleep(base_delay + random.uniform(0, jitter))
+
+def get_cached(key, cache_dict, ttl):
+    if key in cache_dict:
+        data, timestamp = cache_dict[key]
+        if time.time() - timestamp < ttl:
+            return data
+    return None
+
+def set_cached(key, data, cache_dict):
+    cache_dict[key] = (data, time.time())
 
 @app.get("/")
 def root():
@@ -24,11 +50,19 @@ def health():
 
 @app.get("/quote/{symbol}")
 def get_quote(symbol: str):
-    """Get real-time quote for a stock"""
+    # Check cache first
+    cache_key = f"quote_{symbol}"
+    cached = get_cached(cache_key, quote_cache, CACHE_TTL)
+    if cached:
+        return cached
+    
     try:
         ticker = yf.Ticker(symbol)
         info = ticker.info
         history = ticker.history(period="1d")
+        
+        # Small delay to be polite
+        polite_delay(0.2, 0.1)
         
         if len(history) > 0:
             last_row = history.iloc[-1]
@@ -37,7 +71,7 @@ def get_quote(symbol: str):
             change = current_price - open_price
             change_percent = (change / open_price) * 100 if open_price > 0 else 0
             
-            return {
+            result = {
                 "symbol": symbol.upper(),
                 "price": round(current_price, 2),
                 "change": round(change, 2),
@@ -45,110 +79,100 @@ def get_quote(symbol: str):
                 "companyName": info.get('longName', symbol),
                 "success": True
             }
-        return {"symbol": symbol, "success": False, "error": "No data available"}
+            
+            set_cached(cache_key, result, quote_cache)
+            return result
+        return {"symbol": symbol, "success": False, "error": "No data"}
     except Exception as e:
-        return {"symbol": symbol, "success": False, "error": str(e)}
+        error_msg = str(e)
+        if "Rate limited" in error_msg or "Too Many Requests" in error_msg:
+            return {"symbol": symbol, "success": False, "error": "Rate limited - please wait"}
+        return {"symbol": symbol, "success": False, "error": error_msg}
 
 @app.get("/bulk")
 def get_bulk_quotes(symbols: str):
-    """Get multiple quotes at once"""
+    """Fetch multiple quotes efficiently using batch request"""
     symbol_list = [s.strip().upper() for s in symbols.split(",")]
-    results = []
-    for symbol in symbol_list:
-        results.append(get_quote(symbol))
-    return {"quotes": results}
+    
+    # Use batch download for better performance
+    try:
+        # Batch download historical data for all symbols at once
+        data = yf.download(symbol_list, period="1d", group_by='ticker', threads=True)
+        
+        results = []
+        for symbol in symbol_list:
+            try:
+                if symbol in data:
+                    last_row = data[symbol].iloc[-1]
+                    current_price = float(last_row['Close'])
+                    open_price = float(last_row['Open'])
+                    change = current_price - open_price
+                    change_percent = (change / open_price) * 100 if open_price > 0 else 0
+                    
+                    results.append({
+                        "symbol": symbol,
+                        "price": round(current_price, 2),
+                        "change": round(change, 2),
+                        "changePercent": round(change_percent, 2),
+                        "companyName": symbol,
+                        "success": True
+                    })
+                else:
+                    results.append({"symbol": symbol, "success": False, "error": "No data"})
+            except Exception as e:
+                results.append({"symbol": symbol, "success": False, "error": str(e)})
+        
+        return {"quotes": results}
+    except Exception as e:
+        # Fallback to individual requests if batch fails
+        results = []
+        for symbol in symbol_list:
+            results.append(get_quote(symbol))
+        return {"quotes": results}
 
 @app.get("/chart/{symbol}")
 def get_chart(symbol: str, period: str = "1mo"):
-    """Get historical chart data with intraday support for 1d period"""
+    cache_key = f"chart_{symbol}_{period}"
+    cached = get_cached(cache_key, chart_cache, CHART_CACHE_TTL)
+    if cached:
+        return cached
+    
     try:
         ticker = yf.Ticker(symbol)
         
-        # For 1d period, get intraday 5-minute data for detailed chart
         if period == "1d":
             history = ticker.history(period="1d", interval="5m")
-        # For 5d period, get 30-minute intervals
         elif period == "5d":
             history = ticker.history(period="5d", interval="30m")
         else:
-            # For longer periods, use daily data
             history = ticker.history(period=period)
         
-        if not history.empty:
-            chart_data = []
-            for date, row in history.iterrows():
-                # Convert pandas timestamp to Unix timestamp
-                timestamp = int(date.timestamp())
-                close_price = round(float(row['Close']), 2)
-                chart_data.append({
-                    "timestamp": timestamp,
-                    "close": close_price
-                })
-            
-            # Log for debugging on Render
-            print(f"Chart for {symbol} ({period}): {len(chart_data)} points")
-            
-            return {
-                "symbol": symbol.upper(),
-                "data": chart_data,
-                "success": True,
-                "count": len(chart_data)
-            }
-        else:
-            return {
-                "symbol": symbol.upper(), 
-                "success": False, 
-                "error": "No data available for this period"
-            }
-    except Exception as e:
-        print(f"Error fetching chart for {symbol}: {str(e)}")
-        return {"symbol": symbol.upper(), "success": False, "error": str(e)}
-
-@app.get("/historical/{symbol}")
-def get_historical(symbol: str, start_date: str, end_date: str):
-    """Get historical data for a custom date range"""
-    try:
-        ticker = yf.Ticker(symbol)
-        history = ticker.history(start=start_date, end=end_date)
+        polite_delay(0.2, 0.1)
         
         if not history.empty:
             chart_data = []
             for date, row in history.iterrows():
                 chart_data.append({
                     "timestamp": int(date.timestamp()),
-                    "open": round(float(row['Open']), 2),
-                    "high": round(float(row['High']), 2),
-                    "low": round(float(row['Low']), 2),
-                    "close": round(float(row['Close']), 2),
-                    "volume": int(row['Volume']) if row['Volume'] else 0
+                    "close": round(float(row['Close']), 2)
                 })
-            return {"symbol": symbol.upper(), "data": chart_data, "success": True}
-        return {"symbol": symbol.upper(), "success": False, "error": "No data"}
-    except Exception as e:
-        return {"symbol": symbol.upper(), "success": False, "error": str(e)}
-
-@app.get("/info/{symbol}")
-def get_stock_info(symbol: str):
-    """Get detailed stock information"""
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
+            
+            result = {
+                "symbol": symbol.upper(),
+                "data": chart_data,
+                "success": True,
+                "count": len(chart_data)
+            }
+            
+            set_cached(cache_key, result, chart_cache)
+            return result
         
-        return {
-            "symbol": symbol.upper(),
-            "companyName": info.get('longName', symbol),
-            "sector": info.get('sector', 'N/A'),
-            "industry": info.get('industry', 'N/A'),
-            "marketCap": info.get('marketCap', 0),
-            "peRatio": info.get('trailingPE', 0),
-            "dividendYield": info.get('dividendYield', 0),
-            "fiftyTwoWeekHigh": info.get('fiftyTwoWeekHigh', 0),
-            "fiftyTwoWeekLow": info.get('fiftyTwoWeekLow', 0),
-            "avgVolume": info.get('averageVolume', 0),
-            "success": True
-        }
+        return {"symbol": symbol, "success": False, "error": "No data"}
     except Exception as e:
-        return {"symbol": symbol.upper(), "success": False, "error": str(e)}
+        error_msg = str(e)
+        if "Rate limited" in error_msg or "Too Many Requests" in error_msg:
+            return {"symbol": symbol, "success": False, "error": "Rate limited - please wait"}
+        return {"symbol": symbol, "success": False, "error": error_msg}
 
 if __name__ == "__main__":
     import uvicorn

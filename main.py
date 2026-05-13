@@ -5,7 +5,6 @@ from datetime import datetime
 
 app = FastAPI()
 
-# Enable CORS for your Android app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,11 +28,13 @@ def get_quote(symbol: str):
         info = ticker.info
         history = ticker.history(period="1d")
         
-        if not history.empty:
-            current_price = history['Close'].iloc[-1]
-            open_price = history['Open'].iloc[-1]
+        if len(history) > 0:
+            # Convert to list to avoid pandas issues
+            last_row = history.iloc[-1]
+            current_price = float(last_row['Close'])
+            open_price = float(last_row['Open'])
             change = current_price - open_price
-            change_percent = (change / open_price) * 100
+            change_percent = (change / open_price) * 100 if open_price > 0 else 0
             
             return {
                 "symbol": symbol.upper(),
@@ -43,8 +44,7 @@ def get_quote(symbol: str):
                 "companyName": info.get('longName', symbol),
                 "success": True
             }
-        else:
-            return {"symbol": symbol, "success": False, "error": "No data available"}
+        return {"symbol": symbol, "success": False, "error": "No data"}
     except Exception as e:
         return {"symbol": symbol, "success": False, "error": str(e)}
 
@@ -64,15 +64,14 @@ def get_chart(symbol: str, period: str = "1mo"):
         ticker = yf.Ticker(symbol)
         history = ticker.history(period=period)
         
-        if not history.empty:
+        if len(history) > 0:
             chart_data = []
             for date, row in history.iterrows():
                 chart_data.append({
                     "timestamp": int(date.timestamp()),
-                    "close": round(row['Close'], 2)
+                    "close": round(float(row['Close']), 2)
                 })
             return {"symbol": symbol, "data": chart_data, "success": True}
-        else:
-            return {"symbol": symbol, "success": False, "error": "No data available"}
+        return {"symbol": symbol, "success": False, "error": "No data"}
     except Exception as e:
         return {"symbol": symbol, "success": False, "error": str(e)}

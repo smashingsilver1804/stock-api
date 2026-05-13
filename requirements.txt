@@ -4,4 +4,4 @@ yfinance==1.0.0
 pandas==2.2.3
 numpy==1.26.4
 requests==2.32.3
-curl-cffi==0.5.10
+curl-cffi==0.7.0
